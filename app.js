@@ -8,87 +8,104 @@ const port = 3000
 
 const readersPrefix = '/readers'
 
-const pathRegex = /^\/openconfig-interfaces:interfaces\/interface\[name='(.*)'\]\/config$/
-const mtuRegex = /^mtu (\d+)$/m
-const descriptionRegex = /^description '?(.+?)'?$/m
-const shutdownRegex = /^shutdown$/m
-const typeRegex = /^interface\s+(.+)$/m
-const ethernetIfcRegx = /^\d+\/\d+$/
-
-function parseValue(regex, input, closure, callClosureOnlyOnMatch) {
-  let match = regex.exec(input)
-  if (callClosureOnlyOnMatch && match == null) {
-    return // undefined will be removed from json
-  }
-  return closure(match)
-}
-
-function parseIfcType(ifcName) {
-  if (ifcName.indexOf("lag") == 0) {
-    return "iana-if-type:Ieee8023adLag";
-  } else if (ifcName.indexOf("vlan") == 0) {
-    return "iana-if-type:L3ipvlan";
-  } else if (ethernetIfcRegx.exec(ifcName)) {
-    return "iana-if-type:ethernetCsmacd";
-  }
-  return "iana-if-type:Other";
-}
-
-async function reader(path, cli) {
-  let pathMatch = pathRegex.exec(path)
-  if (pathMatch == null) {
-    throw "Cannot parse path"
-  }
-  let ifcName = pathMatch[1]
-  const cmd = "show running-config interface " + ifcName
-  cliResponse = await cli.executeRead(cmd)
-  let model = {"name":ifcName}
-  model["mtu"] = parseValue(mtuRegex, cliResponse, function(match){return parseInt(match[1])}, true)
-  model["description"] = parseValue(descriptionRegex, cliResponse, function(match){return match[1]}, true)
-  model["enabled"] = parseValue(shutdownRegex, cliResponse, function(match) {return match == null})
-  model["type"] = parseValue(typeRegex, cliResponse, function(match) {return parseIfcType(match[1])}, true)
-  return model
-}
-
-app.post(readersPrefix + '/openconfig-interfaces:interfaces/interface/config', async (req, res, next) => {
-  // parse path
+async function execute(req, res, next, reader) {
   console.log("req.body:", req.body)
   let path = req.body["path"]
   console.log("req.body.path:", path)
   let executeRead = async function(cmd) {
     let cliResponse
-    if (req.body["cmd"] != null && typeof req.body["cmd"][cmd] === "string") {
-      cliResponse = req.body["cmd"][cmd]
-    } else {
-      let executeCliCommandEndpoint = req.body["executeCliCommandEndpoint"]
-      console.log("Reading from", executeCliCommandEndpoint)
-      let reqJSON = {"cmd": cmd}
-      var options = {
-        method: 'POST',
-        uri: executeCliCommandEndpoint,
-        body: reqJSON,
-        json: true // Automatically stringifies the body to JSON
-      }
-      cliResponse = await rp(options)
+    let executeCliCommandEndpoint = req.body["executeCliCommandEndpoint"]
+    console.log("Reading from", executeCliCommandEndpoint)
+    let reqJSON = {
+      "cmd": cmd
     }
+    var options = {
+      method: 'POST',
+      uri: executeCliCommandEndpoint,
+      body: reqJSON,
+      json: true // Automatically stringifies the body to JSON
+    }
+    cliResponse = await rp(options)
     console.log("Got cli response:", cliResponse)
     return cliResponse
   }
-  const cli = {"executeRead": executeRead}
+  const cli = {
+    "executeRead": executeRead
+  }
   let model = await reader(path, cli)
   console.log("Sending back", model)
   res.send(model)
+}
+
+
+const IFC = '/openconfig-interfaces:interfaces/interface'
+async function ifcReader(path, cli) {
+  cliResponse = await cli.executeRead("ip link show")
+  let matches = [...cliResponse.matchAll(/(\d+):\s+([^@:]+).*/g)].map(x => {
+    let rObj = {}
+    rObj['name'] = x[2]
+    return rObj
+  });
+
+  let model = {}
+  model['keys'] = matches
+  return model
+}
+app.post(readersPrefix + IFC, async (req, res, next) => {
+  execute(req, res, next, ifcReader)
 })
 
-app.listen(port, () => console.log(`Example app listening on port ${port}!`))
+const IFC_CFG = '/openconfig-interfaces:interfaces/interface/config'
+async function readerIfcCfg(path, cli) {
+  let ifcName = path.match(/name='(.+)'/)[1];
+  cliResponse = await cli.executeRead("ip link show " + ifcName)
 
-/*
-curl -v localhost:3000/readers/openconfig-interfaces:interfaces/interface/config -H "Content-Type: application/json" -d \
+  let enabled = cliResponse.match(/<.*,.*(UP|DOWN).*>/)[1] === "UP"
+  let mtu = parseInt(cliResponse.match(/mtu (\d+)/)[1])
 
-'{"deviceType":"ubnt", "deviceVersion":"1", "path":"/openconfig-interfaces:interfaces/interface[name='\''4/1'\'']/config", "executeCliCommandEndpoint":"http://172.8.0.85:4000/executeCliCommand/secret"}'
+  let model = {}
+  model['name'] = ifcName
+  model['enabled'] = enabled
+  model['mtu'] = mtu > 65535 ? 65535 : mtu
 
-'{"deviceType":"ubnt", "deviceVersion":"1", "path":"/openconfig-interfaces:interfaces/interface[name='\''4/1'\'']/config", "cmd":{"show running-config interface 4/1":"foo\nmtu 99\ndescription descr\nshutdown\ninterface 2/2"}}'
+  return model
+}
+app.post(readersPrefix + IFC_CFG, async (req, res, next) => {
+  execute(req, res, next, readerIfcCfg)
+})
 
-curl -v 172.8.0.85:4000/executeCliCommand/secret -d "{\"cmd\":\"show running-config\"}"
+const IFC_STATE = '/openconfig-interfaces:interfaces/interface/state'
+async function readerIfcState(path, cli) {
+  let ifcName = path.match(/name='(.+)'/)[1];
+  cliResponse = await cli.executeRead("ip link show " + ifcName)
 
- */
+  let model = {}
+  model['name'] = ifcName
+ 
+  return model
+}
+app.post(readersPrefix + IFC_STATE, async (req, res, next) => {
+  execute(req, res, next, readerIfcState)
+})
+
+app.listen(port, () => console.log(`Linux interface plugin listening port ${port}!`))
+
+/** DEMO
+
+Start container:
+
+ docker run -d -h devmanddevel --net devmanddevelnet        --ip 172.8.0.85       --name DEMO       -v "$(realpath ../../):/cache/devmand/repo:ro"       -v "$(realpath ~/cache_devmand_build):/cache/devmand/build:rw"       --entrypoint /bin/bash       "demo/dvmd:9"       -c '/usr/sbin/sshd && bash -c "sleep infinity && ls"'
+
+Start devmand:
+
+ /tmp/tmp.9o00X9FDVP/cmake-build-debug/devmand --logtostderr=1 --device_configuration_file=/root/dev_conf.yaml
+
+Start js reader:
+
+ cd /cache/devmand/build
+ nodemon app.js
+
+Open Sublime:
+Enable Autorefresh on the json file:
+
+**/
