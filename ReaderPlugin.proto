@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package devmand.channels.cli.plugin;
+
+service ReaderPlugin {
+  rpc Read(stream ReadRequest) returns (stream ReadResponse) {}
+}
+
+message ActualReadRequest {
+  string path = 1;
+}
+message CliResponse {
+  string output = 1;
+}
+message ReadRequest {
+  oneof ReadRequestUnion {
+    ActualReadRequest actualReadRequest = 1;
+    CliResponse cliResponse = 2;
+  }
+}
+
+message CliRequest {
+  string cmd = 1;
+}
+message ActualReadResponse {
+  string json = 1;
+}
+message ReadResponse {
+  oneof ReadResponseUnion {
+    CliRequest cliRequest = 1;
+    ActualReadResponse actualReadResponse = 2;
+  }
+}
